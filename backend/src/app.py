@@ -1,15 +1,15 @@
-import json
-import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 from decimal import Decimal
 from typing import Any
 
-import redis
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import analysis_service
+from .triage import build_features
+from .cache import redis_client
 from .casework_routes import router as operational_cases
 from .operations_evidence import router as operations_evidence
 from .auth import create_token, current_user, hash_password, require_roles
@@ -18,8 +18,6 @@ from .middlewares.request_context import AuditRequestMiddleware
 from .schemas.domain import LoginIn, LiftIn, ItemIn, NoticeIn, RecheckIn, RecheckReviewIn
 from .services.queries import fetch_items, fetch_lift
 from .utils.audit import log_action
-
-redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -113,7 +111,8 @@ def dashboard(user=Depends(current_user)):
       (SELECT COUNT(*) FROM certificates WHERE status='issued') AS certificates""")
     recent = rows("""SELECT a.id,a.action,a.entity_type,a.entity_id,a.detail,a.created_at,u.name actor
       FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 8""")
-    return {"stats": stats, "recent": recent, "role": user["role"]}
+    return {"stats": stats, "recent": recent, "role": user["role"],
+            "analysis_jobs": analysis_service.list_jobs(limit=20)}
 
 
 @app.get("/api/lifts")
@@ -144,7 +143,8 @@ def get_lift(lift_id: int, user=Depends(current_user)):
     lift["inspection_items"] = rows("SELECT * FROM inspection_items WHERE lift_id=%s ORDER BY critical DESC,id", (lift_id,))
     lift["notices"] = rows("""SELECT n.*,i.code item_code,i.title item_title FROM rectification_notices n
       JOIN inspection_items i ON i.id=n.inspection_item_id WHERE n.lift_id=%s ORDER BY n.id DESC""", (lift_id,))
-    lift["analysis"] = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
+    lift["analysis"] = analysis_service.latest_job(lift_id)
+    lift["analysis_jobs"] = analysis_service.list_jobs(lift_id=lift_id, limit=20)
     lift["certificate"] = row("SELECT * FROM certificates WHERE lift_id=%s AND status='issued' ORDER BY id DESC LIMIT 1", (lift_id,))
     return lift
 
@@ -172,31 +172,72 @@ def enqueue_review(lift_id: int, user=Depends(require_roles("operator", "supervi
     items = fetch_items(lift_id)
     if len(items) < 3:
         raise HTTPException(409, "至少录入 3 个检验项后才能复核")
-    if row("SELECT id FROM analysis_jobs WHERE lift_id=%s AND status IN ('queued','running')", (lift_id,)):
-        raise HTTPException(409, "该电梯已有复核任务在处理中")
-    features = {
-        "critical_fail_count": sum(1 for x in items if x["result"] == "fail" and x["critical"]),
-        "average_score": round(sum(float(x["score"]) for x in items if x["result"] != "na") / max(1, sum(1 for x in items if x["result"] != "na")), 2),
-        "failed_item_count": sum(1 for x in items if x["result"] == "fail"),
-        "documentation_gap": sum(1 for x in items if x["category"] == "documentation" and x["result"] == "fail"),
+    features = build_features(items)
+    job, created = analysis_service.request_review(lift_id, int(user["sub"]), features, redis_client)
+    if created:
+        if job["state"] == "completed":
+            # Same input was already inferred: the slip gets the advice now, so do
+            # not leave the lift waiting for a worker that has nothing to run.
+            execute("UPDATE lifts SET status='rectification' WHERE id=%s AND status='under_review'", (lift_id,))
+        else:
+            execute("UPDATE lifts SET status='under_review' WHERE id=%s", (lift_id,))
+        log_action(int(user["sub"]), "enqueue_review", "analysis_job", job["id"],
+                   {"lift_id": lift_id, "fingerprint": job["fingerprint"], "inference_id": job["inference_id"]})
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "state": job["state"],
+        "features": features,
+        "fingerprint": job["fingerprint"],
+        "inference_id": job["inference_id"],
+        "shared": not created,
+        "job": job,
     }
-    job_id = execute("INSERT INTO analysis_jobs(lift_id,status,features_json) VALUES(%s,'queued',%s)", (lift_id, json.dumps(features)))
-    redis_client.lpush("lift_analysis", str(job_id))
-    execute("UPDATE lifts SET status='under_review' WHERE id=%s", (lift_id,))
-    log_action(int(user["sub"]), "enqueue_review", "analysis_job", job_id, {"lift_id": lift_id, "features": features})
-    return {"job_id": job_id, "status": "queued", "features": features}
 
 
 @app.get("/api/lifts/{lift_id}/analysis")
 def get_analysis(lift_id: int, user=Depends(current_user)):
     ensure_lift_access(lift_id)
-    result = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
-    if result and result.get("path_rules_json"):
-        try:
-            result["path_rules"] = json.loads(result["path_rules_json"])
-        except Exception:
-            result["path_rules"] = result["path_rules_json"]
-    return result or {"status": "not_started"}
+    return analysis_service.latest_job(lift_id) or {"status": "not_started", "state": "not_started"}
+
+
+@app.get("/api/analysis/jobs")
+def list_analysis_jobs(lift_id: int | None = Query(None), state: str | None = Query(None),
+                       limit: int = Query(100, ge=1, le=500), user=Depends(current_user)):
+    return analysis_service.list_jobs(lift_id=lift_id, state=state, limit=limit)
+
+
+@app.get("/api/analysis/jobs/{job_id}")
+def get_analysis_job(job_id: int, user=Depends(current_user)):
+    job = analysis_service.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "复核单不存在")
+    return job
+
+
+@app.post("/api/analysis/jobs/{job_id}/withdraw")
+def withdraw_analysis_job(job_id: int, user=Depends(require_roles("operator", "supervisor"))):
+    job = analysis_service.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "复核单不存在")
+    if user["role"] == "operator" and job.get("requested_by") not in (None, int(user["sub"])):
+        raise HTTPException(403, "只能撤回自己提交的复核单")
+    updated = analysis_service.withdraw_job(job_id, int(user["sub"]))
+    log_action(int(user["sub"]), "withdraw_review", "analysis_job", job_id,
+               {"lift_id": job["lift_id"], "inference_id": job["inference_id"]})
+    return updated
+
+
+@app.get("/api/analysis/inferences")
+def list_analysis_inferences(limit: int = Query(100, ge=1, le=500), user=Depends(current_user)):
+    return analysis_service.list_inferences(limit=limit)
+
+
+@app.post("/api/analysis/inferences/{inference_id}/retry")
+def retry_analysis_inference(inference_id: int, user=Depends(require_roles("operator", "supervisor"))):
+    outcome = analysis_service.retry_inference(inference_id, redis_client)
+    log_action(int(user["sub"]), "retry_analysis", "analysis_inference", inference_id, outcome)
+    return {"inference_id": inference_id, **outcome}
 
 
 @app.get("/api/notices")

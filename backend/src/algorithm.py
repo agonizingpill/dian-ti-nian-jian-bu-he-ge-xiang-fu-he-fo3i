@@ -1,7 +1,7 @@
-import json
 from sklearn.tree import DecisionTreeClassifier, export_text
 
-FEATURE_NAMES = ["critical_fail_count", "average_score", "failed_item_count", "documentation_gap"]
+from .triage import FEATURE_NAMES, build_features  # noqa: F401  (re-exported for callers)
+
 
 def classify(features: dict):
     # Reproducible training set mirrors the regulator's triage labels for a compact rule extractor.
@@ -19,12 +19,3 @@ def classify(features: dict):
     rules = export_text(model, feature_names=FEATURE_NAMES)
     return {"prediction": prediction, "probability": probability, "path_rules": rules, "features": features, "model": "DecisionTreeClassifier(random_state=1066,max_depth=3)"}
 
-def build_features(items):
-    failed = [x for x in items if x["result"] == "fail"]
-    scores = [float(x["score"]) for x in items if x["result"] != "na"]
-    return {
-        "critical_fail_count": sum(1 for x in failed if x["critical"]),
-        "average_score": round(sum(scores) / len(scores), 2) if scores else 0,
-        "failed_item_count": len(failed),
-        "documentation_gap": sum(1 for x in items if x["category"] == "documentation" and x["result"] == "fail"),
-    }
